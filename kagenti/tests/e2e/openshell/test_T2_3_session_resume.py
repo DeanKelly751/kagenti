@@ -1,12 +1,10 @@
 """
-OpenShell Conversation Resume Tests
+T2.3 Session Resume Tests
 
-Tests that verify conversation state survives pod restarts and PVC-backed
-session resume works correctly.
+Tests session resume across pod restarts and PVC-backed conversation recovery.
 
-Consolidated from:
-- test_session_persistence.py::TestConversationSurvivesRestart
-- NEW: TestConversationResumeFromPVC (writes to PVC, deletes sandbox, recreates)
+Capabilities: session_resume
+Convention: test_{capability}__{description}[agent]
 """
 
 import os
@@ -26,12 +24,11 @@ from kagenti.tests.e2e.openshell.conftest import (
     destructive_tests_enabled,
     AGENT_PROMPTS,
     FIXTURE_MAP,
+    LLM_AVAILABLE,
     LLM_CAPABLE_AGENTS,
 )
 
 pytestmark = pytest.mark.openshell
-
-LLM_AVAILABLE = os.getenv("OPENSHELL_LLM_AVAILABLE", "").lower() == "true"
 AGENT_NS = os.getenv("OPENSHELL_AGENT_NAMESPACE", "team1")
 BASE_IMAGE = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
@@ -99,7 +96,7 @@ ALL_A2A_AGENTS_PORTFORWARD = [
 
 
 @pytest.mark.asyncio
-class TestConversationSurvivesRestart:
+class TestSessionResumeSurvivesRestart:
     """Start conversation, restart pod, try to continue.
 
     This is the core session persistence test: does context survive
@@ -111,9 +108,7 @@ class TestConversationSurvivesRestart:
     """
 
     @pytest.mark.parametrize("agent", ALL_A2A_AGENTS_PORTFORWARD)
-    async def test_restart__agent__multiturn_across_restart(
-        self, agent, agent_namespace
-    ):
+    async def test_session_resume__survives_restart(self, agent, agent_namespace):
         """Turn 1 -> scale 0 -> scale 1 -> Turn 2: does context survive?"""
         if not destructive_tests_enabled():
             pytest.skip(
@@ -174,7 +169,7 @@ class TestConversationSurvivesRestart:
                 proc2.terminate()
                 proc2.wait()
 
-    async def test_restart__weather_supervised__kubectl_exec(self, agent_namespace):
+    async def test_session_resume__kubectl_restart(self, agent_namespace):
         """Supervised agent: restart test via kubectl exec."""
         agent = "weather-agent-supervised"
         if not destructive_tests_enabled():
@@ -203,13 +198,13 @@ class TestConversationSurvivesRestart:
 
 
 @skip_no_crd
-class TestConversationResumeFromPVC:
+class TestSessionResumeFromPVC:
     """Write session state to PVC, delete sandbox, recreate, verify data persists.
 
     This is NEW — tests the full cycle of session resume via PVC.
     """
 
-    def test_resume__generic_sandbox__write_delete_recreate_read(self):
+    def test_session_resume__pvc_recreate(self):
         """Generic sandbox: write to PVC, delete sandbox, recreate, verify data."""
         if not destructive_tests_enabled():
             pytest.skip(

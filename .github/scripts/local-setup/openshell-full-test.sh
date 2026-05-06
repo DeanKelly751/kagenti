@@ -144,7 +144,7 @@ if [ "$PLATFORM" = "ocp" ]; then
     fi
 fi
 
-# ── Source LLM credentials (.env.maas) ──────────────────────────
+# ── Source LLM credentials (.env.maas or OPENAI_API_KEY) ────────
 MAAS_SOURCED=false
 GIT_MAIN_WORKTREE="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git$||' || echo "")"
 for candidate in "$REPO_ROOT/.env.maas" "$PWD/.env.maas" "$GIT_MAIN_WORKTREE/.env.maas"; do
@@ -156,6 +156,14 @@ for candidate in "$REPO_ROOT/.env.maas" "$PWD/.env.maas" "$GIT_MAIN_WORKTREE/.en
         break
     fi
 done
+# CI fallback: use OPENAI_API_KEY when .env.maas is not available
+if [ "$MAAS_SOURCED" = "false" ] && [ -n "${OPENAI_API_KEY:-}" ]; then
+    export MAAS_LLAMA4_API_KEY="$OPENAI_API_KEY"
+    export MAAS_LLAMA4_API_BASE="${MAAS_LLAMA4_API_BASE:-https://litellm-prod.apps.maas.redhatworkshops.io/v1}"
+    export MAAS_LLAMA4_MODEL="${MAAS_LLAMA4_MODEL:-llama-scout-17b}"
+    MAAS_SOURCED=true
+    log_step "Using OPENAI_API_KEY as LiteMaaS credentials (CI mode)"
+fi
 export MAAS_SOURCED
 
 # ── Summary ─────────────────────────────────────────────────────
@@ -195,6 +203,22 @@ if [ "$SKIP_CREATE" = "false" ]; then
     else
         log_phase "PHASE 1: Create HyperShift Cluster"
         export KUBECONFIG="${MGMT_KUBECONFIG:-$HOME/.kube/kagenti-team-mgmt.kubeconfig}"
+
+        # Clean up stale cluster from cancelled/failed CI runs
+        if [ -n "${HCP_CLUSTER_NAME:-}" ]; then
+            STALE_NS="clusters-$HCP_CLUSTER_NAME"
+            if kubectl get ns "$STALE_NS" &>/dev/null; then
+                log_warn "Stale namespace $STALE_NS found — cleaning up before create"
+                if [ -x "./.github/scripts/hypershift/ci/55-cleanup-existing-cluster.sh" ]; then
+                    CLUSTER_SUFFIX="$CLUSTER_SUFFIX" \
+                        ./.github/scripts/hypershift/ci/55-cleanup-existing-cluster.sh || true
+                else
+                    kubectl delete ns "$STALE_NS" --wait=false 2>/dev/null || true
+                    sleep 15
+                fi
+            fi
+        fi
+
         ./.github/scripts/hypershift/create-cluster.sh "$CLUSTER_SUFFIX"
         export KUBECONFIG="$HOSTED_KUBECONFIG"
         log_step "Switched to hosted cluster: $KUBECONFIG"
@@ -264,9 +288,9 @@ fi
 # ============================================================================
 log_phase "PHASE 4: Deploy Shared Infrastructure"
 
-SHARED_ARGS=()
+SHARED_ARGS=(--pre-pull)
 if [ "$PLATFORM" = "kind" ]; then
-    SHARED_ARGS+=(--pre-pull --kind-cluster "$CLUSTER_NAME")
+    SHARED_ARGS+=(--kind-cluster "$CLUSTER_NAME")
 fi
 if [ "$MAAS_SOURCED" = "true" ]; then
     SHARED_ARGS+=(--litellm)
@@ -303,6 +327,17 @@ if [ "$SKIP_TEST" = "false" ]; then
 
     if [ "$MAAS_SOURCED" = "true" ]; then
         export OPENSHELL_LLM_AVAILABLE=true
+        export OPENSHELL_LLM_MODELS="${OPENSHELL_LLM_MODELS:-llama-scout-17b,deepseek-r1}"
+        log_step "LLM tests enabled (models: $OPENSHELL_LLM_MODELS)"
+    fi
+
+    # Enable NemoClaw tests if agents are deployed and healthy
+    if kubectl get deploy nemoclaw-openclaw -n team1 &>/dev/null; then
+        READY=$(kubectl get deploy nemoclaw-openclaw -n team1 -o jsonpath='{.status.readyReplicas}' 2>/dev/null || echo "0")
+        if [ "${READY:-0}" -ge 1 ]; then
+            export OPENSHELL_NEMOCLAW_ENABLED=true
+            log_step "NemoClaw tests enabled (openclaw ready)"
+        fi
     fi
 
     TEST_DIR="kagenti/tests/e2e/openshell"

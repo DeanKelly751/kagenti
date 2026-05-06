@@ -116,7 +116,7 @@ echo ""
 
 # ── Helper: wait for deployment ─────────────────────────────────────────────
 wait_deployment_ready() {
-  local name=$1 namespace=$2 timeout=${3:-120}
+  local name=$1 namespace=$2 timeout=${3:-300}
   if $DRY_RUN; then return 0; fi
   log_info "Waiting for deployment $name in $namespace (timeout: ${timeout}s)..."
   kubectl wait --for=condition=Available deployment/"$name" \
@@ -257,7 +257,9 @@ if $STEP_GATEWAY_API && ! is_openshift; then
       PILOT_ENABLE_ALPHA_GATEWAY_API=true
 
     if ! $DRY_RUN; then
-      kubectl rollout status deployment/istiod -n istio-system --timeout=60s
+      kubectl rollout status deployment/istiod -n istio-system --timeout=120s || {
+        log_warn "istiod rollout slow — continuing (will settle during tenant deploy)"
+      }
     fi
     log_success "Istio alpha Gateway API support enabled"
   fi
@@ -504,6 +506,8 @@ if $STEP_LITELLM; then
   LITELLM_NS="${LITELLM_NS:-team1}"
   LITELLM_PROXY_NAME="litellm-model-proxy"
 
+  DEEPSEEK_MODEL="${MAAS_DEEPSEEK_MODEL:-deepseek-r1-distill-qwen-14b}"
+
   if [[ -z "$LITEMAAS_KEY" ]]; then
     log_warn "MAAS_LLAMA4_API_KEY not set — skipping LiteLLM proxy"
   elif kubectl get deployment "$LITELLM_PROXY_NAME" -n "$LITELLM_NS" &>/dev/null \
@@ -513,6 +517,17 @@ if $STEP_LITELLM; then
     log_info "Deploying LiteLLM model proxy in namespace $LITELLM_NS..."
     kubectl get ns "$LITELLM_NS" &>/dev/null || run_cmd kubectl create ns "$LITELLM_NS"
 
+    # Store API key in a Secret (not plaintext in ConfigMap)
+    kubectl create secret generic litemaas-credentials -n "$LITELLM_NS" \
+        --from-literal=api-key="$LITEMAAS_KEY" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # Also create litellm-virtual-keys for sandbox agents
+    kubectl create secret generic litellm-virtual-keys -n "$LITELLM_NS" \
+        --from-literal=api-key="$LITEMAAS_KEY" \
+        --dry-run=client -o yaml | kubectl apply -f -
+
+    # hosted_vllm/ provider avoids LiteLLM's OpenAI Responses API bridge
     run_cmd kubectl apply -f - <<EOLITELLM
 apiVersion: v1
 kind: ConfigMap
@@ -521,49 +536,60 @@ metadata:
   namespace: $LITELLM_NS
 data:
   config.yaml: |
+    litellm_settings:
+      drop_params: true
+      use_chat_completions_url_for_anthropic_messages: true
     model_list:
       - model_name: "gpt-4o-mini"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "gpt-4o"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "gpt-4"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "gpt-5-nano"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "gpt-5"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "gpt-5-mini"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
       - model_name: "$LITEMAAS_MODEL"
         litellm_params:
-          model: "openai/$LITEMAAS_MODEL"
+          model: "hosted_vllm/$LITEMAAS_MODEL"
           api_base: "$LITEMAAS_URL"
-          api_key: "$LITEMAAS_KEY"
-          use_chat_completions_api: true
+          api_key: "os.environ/LITEMAAS_API_KEY"
+      - model_name: "claude-sonnet-4-20250514"
+        litellm_params:
+          model: "hosted_vllm/$LITEMAAS_MODEL"
+          api_base: "$LITEMAAS_URL"
+          api_key: "os.environ/LITEMAAS_API_KEY"
+      - model_name: "claude-haiku-4-20250414"
+        litellm_params:
+          model: "hosted_vllm/$LITEMAAS_MODEL"
+          api_base: "$LITEMAAS_URL"
+          api_key: "os.environ/LITEMAAS_API_KEY"
+      - model_name: "deepseek-r1"
+        litellm_params:
+          model: "hosted_vllm/$DEEPSEEK_MODEL"
+          api_base: "$LITEMAAS_URL"
+          api_key: "os.environ/LITEMAAS_API_KEY"
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -590,6 +616,12 @@ spec:
         ports:
         - containerPort: 4000
           name: http
+        env:
+        - name: LITEMAAS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: litemaas-credentials
+              key: api-key
         resources:
           requests:
             cpu: 100m
@@ -627,8 +659,8 @@ spec:
 EOLITELLM
 
     if ! $DRY_RUN; then
-      kubectl rollout status "deploy/$LITELLM_PROXY_NAME" -n "$LITELLM_NS" --timeout=120s || {
-        log_warn "LiteLLM proxy rollout not complete"
+      kubectl rollout status "deploy/$LITELLM_PROXY_NAME" -n "$LITELLM_NS" --timeout=60s || {
+        log_warn "LiteLLM proxy still pulling image — continuing (will be ready by test phase)"
       }
     fi
     log_success "LiteLLM model proxy deployed"
@@ -651,29 +683,48 @@ if $STEP_PREPULL; then
 
   BASE_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
 
+  # Read gateway image tags from values.yaml
+  CHART_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/charts/openshell"
+  GW_REPO=$(grep -A2 'gateway:' "$CHART_DIR/values.yaml" | grep 'repository:' | awk '{print $2}')
+  GW_TAG=$(grep -A3 'gateway:' "$CHART_DIR/values.yaml" | grep 'tag:' | awk '{print $2}')
+  CD_REPO=$(grep -A2 'computeDriver:' "$CHART_DIR/values.yaml" | grep 'repository:' | awk '{print $2}')
+  CD_TAG=$(grep -A3 'computeDriver:' "$CHART_DIR/values.yaml" | grep 'tag:' | awk '{print $2}')
+  CR_REPO=$(grep -A2 'credentialsDriver:' "$CHART_DIR/values.yaml" | grep 'repository:' | awk '{print $2}')
+  CR_TAG=$(grep -A3 'credentialsDriver:' "$CHART_DIR/values.yaml" | grep 'tag:' | awk '{print $2}')
+
   if is_openshift; then
-    # OCP: Start a pull Job in team1 (non-blocking)
-    if ! kubectl get job openshell-base-pull -n team1 &>/dev/null; then
-      log_info "Starting base sandbox image pre-pull Job (OCP)..."
+    # OCP: Start pull Jobs for all images in parallel (non-blocking)
+    PULL_IMAGES="$BASE_IMAGE ${GW_REPO}:${GW_TAG} ${CD_REPO}:${CD_TAG} ${CR_REPO}:${CR_TAG}"
+    for img in $PULL_IMAGES; do
+      job_name="pull-$(echo "$img" | sed 's|[/:.@]|-|g' | tail -c 58)"
+      if kubectl get job "$job_name" -n team1 &>/dev/null; then
+        continue
+      fi
+      log_info "Pre-pulling $img..."
       run_cmd kubectl apply -f - <<EOJOB
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: openshell-base-pull
+  name: $job_name
   namespace: team1
 spec:
-  ttlSecondsAfterFinished: 600
+  ttlSecondsAfterFinished: 300
   template:
     spec:
       containers:
       - name: pull
-        image: $BASE_IMAGE
-        command: ["echo", "Image pulled successfully"]
+        image: $img
+        imagePullPolicy: Always
+        command: ["echo", "pulled"]
       restartPolicy: Never
 EOJOB
-    else
-      log_success "Base image pre-pull Job already exists"
-    fi
+    done
+    log_info "Waiting for pre-pull Jobs to complete (up to 10 min)..."
+    for jn in $PULL_IMAGES; do
+      jname="pull-$(echo "$jn" | sed 's|[/:.@]|-|g' | tail -c 58)"
+      kubectl wait --for=condition=Complete "job/$jname" \
+        -n team1 --timeout=600s 2>/dev/null || log_warn "Pre-pull $jname not complete"
+    done
   else
     # Kind: docker pull + kind load
     if docker exec "${KIND_CLUSTER}-control-plane" crictl images 2>/dev/null | grep -q "sandboxes/base"; then
